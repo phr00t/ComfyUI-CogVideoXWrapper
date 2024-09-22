@@ -4,6 +4,19 @@ import folder_paths
 import comfy.model_management as mm
 from comfy.utils import ProgressBar, load_torch_file
 from diffusers.schedulers import CogVideoXDDIMScheduler, CogVideoXDPMScheduler, DDIMScheduler, DEISMultistepScheduler, SASolverScheduler, PNDMScheduler, DPMSolverMultistepScheduler, EulerDiscreteScheduler, EulerAncestralDiscreteScheduler,  LCMScheduler, UniPCMultistepScheduler, TCDScheduler, HeunDiscreteScheduler, DPMSolverSinglestepScheduler
+scheduler_mapping = {
+    "DPM++": DPMSolverMultistepScheduler,
+    "Euler": EulerDiscreteScheduler,
+    "Euler A": EulerAncestralDiscreteScheduler,
+    "PNDM": PNDMScheduler,
+    "DDIM": DDIMScheduler,
+    "CogVideoXDDIM": CogVideoXDDIMScheduler,
+    "CogVideoXDPMScheduler": CogVideoXDPMScheduler,
+    "SASolverScheduler": SASolverScheduler,
+    "UniPCMultistepScheduler": UniPCMultistepScheduler,
+    "HeunDiscreteScheduler": HeunDiscreteScheduler,
+    "DEISMultistepScheduler": DEISMultistepScheduler
+}
 
 from diffusers.models import AutoencoderKLCogVideoX, CogVideoXTransformer3DModel
 from .pipeline_cogvideox import CogVideoXPipeline
@@ -22,6 +35,104 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 log = logging.getLogger(__name__)
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
+
+class PABConfig:
+    def __init__(
+        self,
+        steps: int,
+        cross_broadcast: bool = False,
+        cross_threshold: list = None,
+        cross_range: int = None,
+        spatial_broadcast: bool = False,
+        spatial_threshold: list = None,
+        spatial_range: int = None,
+        temporal_broadcast: bool = False,
+        temporal_threshold: list = None,
+        temporal_range: int = None,
+        mlp_broadcast: bool = False,
+        mlp_spatial_broadcast_config: dict = None,
+        mlp_temporal_broadcast_config: dict = None,
+    ):
+        self.steps = steps
+
+        self.cross_broadcast = cross_broadcast
+        self.cross_threshold = cross_threshold
+        self.cross_range = cross_range
+
+        self.spatial_broadcast = spatial_broadcast
+        self.spatial_threshold = spatial_threshold
+        self.spatial_range = spatial_range
+
+        self.temporal_broadcast = temporal_broadcast
+        self.temporal_threshold = temporal_threshold
+        self.temporal_range = temporal_range
+
+        self.mlp_broadcast = mlp_broadcast
+        self.mlp_spatial_broadcast_config = mlp_spatial_broadcast_config
+        self.mlp_temporal_broadcast_config = mlp_temporal_broadcast_config
+        self.mlp_temporal_outputs = {}
+        self.mlp_spatial_outputs = {}
+
+class CogVideoXPABConfig(PABConfig):
+    def __init__(
+        self,
+        steps: int = 50,
+        spatial_broadcast: bool = True,
+        spatial_threshold: list = [100, 850],
+        spatial_range: int = 2,
+        temporal_broadcast: bool = True,
+        temporal_threshold: list = [100, 850],
+        temporal_range: int = 2,
+    ):
+        super().__init__(
+            steps=steps,
+            spatial_broadcast=spatial_broadcast,
+            spatial_threshold=spatial_threshold,
+            spatial_range=spatial_range,
+            temporal_broadcast=temporal_broadcast,
+            temporal_threshold=temporal_threshold,
+            temporal_range=temporal_range
+
+        )
+
+from .videosys.cogvideox_transformer_3d import CogVideoXTransformer3DModel as CogVideoXTransformer3DModelPAB
+
+class CogVideoPABConfig:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "spatial_broadcast": ("BOOLEAN", {"default": True, "tooltip": "Enable Spatial PAB"}),
+            "spatial_threshold_start": ("INT", {"default": 850, "min": 0, "max": 1000, "tooltip": "PAB Start Timestep"} ),
+            "spatial_threshold_end": ("INT", {"default": 100, "min": 0, "max": 1000, "tooltip": "PAB End Timestep"} ),
+            "spatial_range": ("INT", {"default": 2, "min": 0, "max": 10, "tooltip": "Broadcast timesteps range"} ),
+            "temporal_broadcast": ("BOOLEAN", {"default": False, "tooltip": "Enable Temporal PAB"}),
+            "temporal_threshold_start": ("INT", {"default": 850, "min": 0, "max": 1000, "tooltip": "PAB Start Timestep"} ),
+            "temporal_threshold_end": ("INT", {"default": 100, "min": 0, "max": 1000, "tooltip": "PAB End Timestep"} ),
+            "temporal_range": ("INT", {"default": 2, "min": 0, "max": 10, "tooltip": "Broadcast timesteps range"} ),
+            "steps": ("INT", {"default": 50, "min": 0, "max": 1000, "tooltip": "Steps"} ),
+            }
+        }
+
+    RETURN_TYPES = ("PAB_CONFIG",)
+    RETURN_NAMES = ("pab_config", )
+    FUNCTION = "config"
+    CATEGORY = "CogVideoWrapper"
+    DESCRIPTION = "EXPERIMENTAL:Pyramid Attention Broadcast (PAB) speeds up inference by mitigating redundant attention computation"
+
+    def config(self, spatial_broadcast, spatial_threshold_start, spatial_threshold_end, spatial_range, 
+               temporal_broadcast, temporal_threshold_start, temporal_threshold_end, temporal_range, steps):
+        
+        pab_config = CogVideoXPABConfig(
+            steps=steps, 
+            spatial_broadcast=spatial_broadcast, 
+            spatial_threshold=[spatial_threshold_end, spatial_threshold_start], 
+            spatial_range=spatial_range,
+            temporal_broadcast=temporal_broadcast,
+            temporal_threshold=[temporal_threshold_end, temporal_threshold_start],
+            temporal_range=temporal_range
+            )
+
+        return (pab_config, )
 
 class DownloadAndLoadCogVideoModel:
     @classmethod
@@ -47,6 +158,7 @@ class DownloadAndLoadCogVideoModel:
                 "fp8_transformer": (['disabled', 'enabled', 'fastmode'], {"default": 'disabled', "tooltip": "enabled casts the transformer to torch.float8_e4m3fn, fastmode is only for latest nvidia GPUs"}),
                 "compile": (["disabled","onediff","torch"], {"tooltip": "compile the model for faster inference, these are advanced options only available on Linux, see readme for more info"}),
                 "enable_sequential_cpu_offload": ("BOOLEAN", {"default": False, "tooltip": "significantly reducing memory usage and slows down the inference"}),
+                "pab_config": ("PAB_CONFIG", {"default": None}),
             }
         }
 
@@ -55,7 +167,7 @@ class DownloadAndLoadCogVideoModel:
     FUNCTION = "loadmodel"
     CATEGORY = "CogVideoWrapper"
 
-    def loadmodel(self, model, precision, fp8_transformer="disabled", compile="disabled", enable_sequential_cpu_offload=False):
+    def loadmodel(self, model, precision, fp8_transformer="disabled", compile="disabled", enable_sequential_cpu_offload=False, pab_config=None):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         mm.soft_empty_cache()
@@ -102,7 +214,10 @@ class DownloadAndLoadCogVideoModel:
         if "Fun" in model:
             transformer = CogVideoXTransformer3DModelFun.from_pretrained(base_path, subfolder="transformer")
         else:
-            transformer = CogVideoXTransformer3DModel.from_pretrained(base_path, subfolder="transformer")
+            if pab_config is not None:
+                transformer = CogVideoXTransformer3DModelPAB.from_pretrained(base_path, subfolder="transformer")
+            else:
+                transformer = CogVideoXTransformer3DModel.from_pretrained(base_path, subfolder="transformer")
         
         transformer = transformer.to(dtype).to(offload_device)
         
@@ -124,7 +239,7 @@ class DownloadAndLoadCogVideoModel:
 
         with open(scheduler_path) as f:
             scheduler_config = json.load(f)
-        scheduler = CogVideoXDDIMScheduler.from_config(scheduler_config)  
+        scheduler = CogVideoXDDIMScheduler.from_config(scheduler_config)     
 
         # VAE
         if "Fun" in model:
@@ -132,7 +247,7 @@ class DownloadAndLoadCogVideoModel:
             pipe = CogVideoX_Fun_Pipeline_Inpaint(vae, transformer, scheduler)
         else:
             vae = AutoencoderKLCogVideoX.from_pretrained(base_path, subfolder="vae").to(dtype).to(offload_device)
-            pipe = CogVideoXPipeline(vae, transformer, scheduler)
+            pipe = CogVideoXPipeline(vae, transformer, scheduler, pab_config=pab_config)
 
         if enable_sequential_cpu_offload:
             pipe.enable_sequential_cpu_offload()
@@ -702,7 +817,6 @@ class CogVideoDecode:
 
         video = pipeline["pipe"].video_processor.postprocess_video(video=frames, output_type="pt")
         video = video[0].permute(0, 2, 3, 1).cpu().float()
-        print(video.min(), video.max())
 
         return (video,)
 
@@ -977,7 +1091,8 @@ NODE_CLASS_MAPPINGS = {
     "CogVideoXFunSampler": CogVideoXFunSampler,
     "CogVideoXFunVid2VidSampler": CogVideoXFunVid2VidSampler,
     "CogVideoTextEncodeCombine": CogVideoTextEncodeCombine,
-    "DownloadAndLoadCogVideoGGUFModel": DownloadAndLoadCogVideoGGUFModel
+    "DownloadAndLoadCogVideoGGUFModel": DownloadAndLoadCogVideoGGUFModel,
+    "CogVideoPABConfig": CogVideoPABConfig
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadCogVideoModel": "(Down)load CogVideo Model",
@@ -989,5 +1104,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CogVideoXFunSampler": "CogVideoXFun Sampler",
     "CogVideoXFunVid2VidSampler": "CogVideoXFun Vid2Vid Sampler",
     "CogVideoTextEncodeCombine": "CogVideo TextEncode Combine",
-    "DownloadAndLoadCogVideoGGUFModel": "(Down)load CogVideo GGUF Model"
+    "DownloadAndLoadCogVideoGGUFModel": "(Down)load CogVideo GGUF Model",
+    "CogVideoPABConfig": "CogVideo PABConfig"
     }
