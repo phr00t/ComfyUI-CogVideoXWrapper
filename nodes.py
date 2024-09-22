@@ -3,7 +3,7 @@ import torch
 import folder_paths
 import comfy.model_management as mm
 from comfy.utils import ProgressBar, load_torch_file
-from diffusers.schedulers import CogVideoXDDIMScheduler, CogVideoXDPMScheduler, DDIMScheduler, PNDMScheduler, DPMSolverMultistepScheduler, EulerDiscreteScheduler, EulerAncestralDiscreteScheduler, LCMScheduler, UniPCMultistepScheduler, TCDScheduler, HeunDiscreteScheduler, DPMSolverSinglestepScheduler
+from diffusers.schedulers import CogVideoXDDIMScheduler, CogVideoXDPMScheduler, DDIMScheduler, DEISMultistepScheduler, SASolverScheduler, PNDMScheduler, DPMSolverMultistepScheduler, EulerDiscreteScheduler, EulerAncestralDiscreteScheduler,  LCMScheduler, UniPCMultistepScheduler, TCDScheduler, HeunDiscreteScheduler, DPMSolverSinglestepScheduler
 
 from diffusers.models import AutoencoderKLCogVideoX, CogVideoXTransformer3DModel
 from .pipeline_cogvideox import CogVideoXPipeline
@@ -731,6 +731,8 @@ class CogVideoXFunSampler:
                         "UniPC",
                         "TCD",
                         "Heun",
+                        "DEIS",
+                        "SASolver",
                         "DPMSingleStep",
                         "CogVideoXDDIM",
                         "CogVideoXDPMScheduler",
@@ -774,7 +776,7 @@ class CogVideoXFunSampler:
         else:
             original_width = opt_empty_latent["samples"][0].shape[-1] * 8
             original_height = opt_empty_latent["samples"][0].shape[-2] * 8
-        
+
         # Load Sampler
         scheduler_config = pipeline["scheduler_config"]
         if scheduler == "DPM++":
@@ -793,6 +795,10 @@ class CogVideoXFunSampler:
             noise_scheduler = UniPCMultistepScheduler.from_config(scheduler_config)
         elif scheduler == "TCD":
             noise_scheduler = TCDScheduler.from_config(scheduler_config)
+        elif scheduler == "SASolver":
+            noise_scheduler = SASolverScheduler.from_config(scheduler_config)
+        elif scheduler == "DEIS":
+            noise_scheduler = DEISMultistepScheduler.from_config(scheduler_config)
         elif scheduler == "Heun":
             noise_scheduler = HeunDiscreteScheduler.from_config(scheduler_config)
         elif scheduler == "DPMSingleStep":
@@ -859,6 +865,8 @@ class CogVideoXFunVid2VidSampler:
                         "UniPC",
                         "TCD",
                         "Heun",
+                        "DEIS",
+                        "SASolver",
                         "DPMSingleStep",
                         "CogVideoXDDIM",
                         "CogVideoXDPMScheduler",
@@ -916,6 +924,10 @@ class CogVideoXFunVid2VidSampler:
             noise_scheduler = TCDScheduler.from_pretrained(base_path, subfolder= 'scheduler')
         elif scheduler == "Heun":
             noise_scheduler = HeunDiscreteScheduler.from_pretrained(base_path, subfolder= 'scheduler')
+        elif scheduler == "SASolver":
+            noise_scheduler = SASolverScheduler.from_pretrained(base_path, subfolder= 'scheduler')
+        elif scheduler == "DEIS":
+            noise_scheduler = DEISMultistepScheduler.from_pretrained(base_path, subfolder= 'scheduler')
         elif scheduler == "DPMSingleStep":
             noise_scheduler = DPMSolverSinglestepScheduler.from_pretrained(base_path, subfolder= 'scheduler')
         elif scheduler == "CogVideoXDDIM":
