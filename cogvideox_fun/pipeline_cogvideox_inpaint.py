@@ -302,7 +302,7 @@ class CogVideoX_Fun_Pipeline_Inpaint(VideoSysPipeline):
             # if strength is 1. then initialise the latents to noise, else initial to image + noise
             latents = noise if is_strength_max else self.scheduler.add_noise(video_latents, noise, timestep)
             # if pure noise then scale the initial latents by the  Scheduler's init sigma
-            latents = latents * self.scheduler.init_noise_sigma if is_strength_max else latents
+            latents = latents * self.scheduler.init_noise_sigma if is_strength_max and hasattr(self.scheduler, 'init_noise_sigma') else latents
         else:
             noise = latents.to(device)
             latents = noise * self.scheduler.init_noise_sigma

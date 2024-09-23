@@ -3,7 +3,7 @@ import torch
 import folder_paths
 import comfy.model_management as mm
 from comfy.utils import ProgressBar, load_torch_file
-from diffusers.schedulers import CogVideoXDDIMScheduler, CogVideoXDPMScheduler, DDIMScheduler, DEISMultistepScheduler, SASolverScheduler, PNDMScheduler, DPMSolverMultistepScheduler, EulerDiscreteScheduler, EulerAncestralDiscreteScheduler,  LCMScheduler, UniPCMultistepScheduler, TCDScheduler, HeunDiscreteScheduler, DPMSolverSinglestepScheduler
+from diffusers.schedulers import CogVideoXDDIMScheduler, CogVideoXDPMScheduler, DDIMScheduler, DEISMultistepScheduler, SASolverScheduler, PNDMScheduler, DPMSolverMultistepScheduler, EulerDiscreteScheduler, EulerAncestralDiscreteScheduler,  LCMScheduler, UniPCMultistepScheduler, TCDScheduler, HeunDiscreteScheduler, DPMSolverSinglestepScheduler, KDPM2AncestralDiscreteScheduler
 
 import importlib.metadata
 
@@ -932,6 +932,7 @@ class CogVideoXFunSampler:
                         "UniPC",
                         "TCD",
                         "Heun",
+                        "KDPM2A",
                         "DEIS",
                         "SASolver",
                         "DPMSingleStep",
@@ -977,10 +978,6 @@ class CogVideoXFunSampler:
         else:
             original_width = opt_empty_latent["samples"][0].shape[-1] * 8
             original_height = opt_empty_latent["samples"][0].shape[-2] * 8
-
-        closest_size, closest_ratio = get_closest_ratio(original_height, original_width, ratios=aspect_ratio_sample_size)
-        height, width = [int(x / 16) * 16 for x in closest_size]
-        log.info(f"Closest bucket size: {width}x{height}")
         
         # Load Sampler
         scheduler_config = pipeline["scheduler_config"]
@@ -1006,6 +1003,8 @@ class CogVideoXFunSampler:
             noise_scheduler = DEISMultistepScheduler.from_config(scheduler_config)
         elif scheduler == "Heun":
             noise_scheduler = HeunDiscreteScheduler.from_config(scheduler_config)
+        elif scheduler == "KDPM2A":
+            noise_scheduler = KDPM2AncestralDiscreteScheduler.from_config(scheduler_config)
         elif scheduler == "DPMSingleStep":
             noise_scheduler = DPMSolverSinglestepScheduler.from_config(scheduler_config)    
         elif scheduler == "CogVideoXDDIM":
@@ -1069,6 +1068,7 @@ class CogVideoXFunVid2VidSampler:
                         "UniPC",
                         "TCD",
                         "Heun",
+                        "KDPM2A",
                         "DEIS",
                         "SASolver",
                         "DPMSingleStep",
@@ -1108,8 +1108,6 @@ class CogVideoXFunVid2VidSampler:
         original_width, original_height = Image.fromarray(validation_video[0]).size
         
         base_path = pipeline["base_path"]
-        closest_size, closest_ratio = get_closest_ratio(original_height, original_width, ratios=aspect_ratio_sample_size)
-        height, width = [int(x / 16) * 16 for x in closest_size]
 
         # Load Sampler
         if scheduler == "DPM++":
@@ -1130,6 +1128,8 @@ class CogVideoXFunVid2VidSampler:
             noise_scheduler = TCDScheduler.from_pretrained(base_path, subfolder= 'scheduler')
         elif scheduler == "Heun":
             noise_scheduler = HeunDiscreteScheduler.from_pretrained(base_path, subfolder= 'scheduler')
+        elif scheduler == "KDPM2A":
+            noise_scheduler = KDPM2AncestralDiscreteScheduler.from_pretrained(base_path, subfolder= 'scheduler')
         elif scheduler == "SASolver":
             noise_scheduler = SASolverScheduler.from_pretrained(base_path, subfolder= 'scheduler')
         elif scheduler == "DEIS":
