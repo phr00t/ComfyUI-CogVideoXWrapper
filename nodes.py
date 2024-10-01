@@ -1099,7 +1099,7 @@ class CogVideoXFunVid2VidSampler:
     FUNCTION = "process"
     CATEGORY = "CogVideoWrapper"
 
-    def process(self, pipeline, positive, negative, video_length, base_resolution, seed, steps, cfg, denoise_strength, scheduler, 
+    def process(self, pipeline, positive, negative, video_length, width, height, seed, steps, cfg, denoise_strength, scheduler, 
                 validation_video):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -1115,15 +1115,7 @@ class CogVideoXFunVid2VidSampler:
 
         mm.soft_empty_cache()
 
-        # Count most suitable height and width
-        aspect_ratio_sample_size    = {key : [x / 512 * base_resolution for x in ASPECT_RATIO_512[key]] for key in ASPECT_RATIO_512.keys()}
-
         validation_video = np.array(validation_video.cpu().numpy() * 255, np.uint8)
-        original_width, original_height = Image.fromarray(validation_video[0]).size
-
-        closest_size, closest_ratio = get_closest_ratio(original_height, original_width, ratios=aspect_ratio_sample_size)
-        height, width = [int(x / 16) * 16 for x in closest_size]
-
         # Load Sampler
         if scheduler == "DPM++":
             noise_scheduler = DPMSolverMultistepScheduler.from_pretrained(base_path, subfolder= 'scheduler')
@@ -1200,9 +1192,8 @@ class CogVideoXFunControlSampler:
                 "positive": ("CONDITIONING", ),
                 "negative": ("CONDITIONING", ),
                 "video_length": ("INT", {"default": 49, "min": 5, "max": 49, "step": 4}),
-                "base_resolution": (
-                    [256,320,384,448,512,768,960,1024,], {"default": 512}
-                ),
+                "width": ("INT", {"default": 720, "min": 256, "max": 1024, "step": 4}),
+                "height": ("INT", {"default": 480, "min": 256, "max": 1024, "step": 4}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
                 "steps": ("INT", {"default": 25, "min": 1, "max": 200, "step": 1}),
                 "cfg": ("FLOAT", {"default": 6.0, "min": 1.0, "max": 20.0, "step": 0.01}),
@@ -1236,7 +1227,7 @@ class CogVideoXFunControlSampler:
     FUNCTION = "process"
     CATEGORY = "CogVideoWrapper"
 
-    def process(self, pipeline, positive, negative, video_length, base_resolution, seed, steps, cfg, scheduler, 
+    def process(self, pipeline, positive, negative, video_length, width, height, seed, steps, cfg, scheduler, 
                 control_video=None, control_strength=1.0, control_start_percent=0.0, control_end_percent=1.0):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -1251,14 +1242,7 @@ class CogVideoXFunControlSampler:
 
         mm.soft_empty_cache()
 
-        # Count most suitable height and width
-        aspect_ratio_sample_size    = {key : [x / 512 * base_resolution for x in ASPECT_RATIO_512[key]] for key in ASPECT_RATIO_512.keys()}
-
         control_video = np.array(control_video.cpu().numpy() * 255, np.uint8)
-        original_width, original_height = Image.fromarray(control_video[0]).size
-
-        closest_size, closest_ratio = get_closest_ratio(original_height, original_width, ratios=aspect_ratio_sample_size)
-        height, width = [int(x / 16) * 16 for x in closest_size]
 
         # Load Sampler
         scheduler_config = pipeline["scheduler_config"]
