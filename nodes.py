@@ -329,6 +329,14 @@ class DownloadAndLoadCogVideoModel:
         
         transformer = transformer.to(dtype).to(offload_device)
 
+        if lora is not None:
+            if lora['strength'] > 0:
+                logging.info(f"Merging LoRA weights from {lora['path']} with strength {lora['strength']}")
+                transformer = merge_lora(transformer, lora["path"], lora["strength"])
+            else:
+                logging.info(f"Removing LoRA weights from {lora['path']} with strength {lora['strength']}")
+                transformer = unmerge_lora(transformer, lora["path"], lora["strength"])
+
         if block_edit is not None:
             transformer = remove_specific_blocks(transformer, block_edit)
         
@@ -363,13 +371,7 @@ class DownloadAndLoadCogVideoModel:
             vae = AutoencoderKLCogVideoX.from_pretrained(base_path, subfolder="vae").to(dtype).to(offload_device)
             pipe = CogVideoXPipeline(vae, transformer, scheduler, pab_config=pab_config)
 
-        if lora is not None:
-            if lora['strength'] > 0:
-                logging.info(f"Merging LoRA weights from {lora['path']} with strength {lora['strength']}")
-                pipe = merge_lora(pipe, lora["path"], lora["strength"])
-            else:
-                logging.info(f"Removing LoRA weights from {lora['path']} with strength {lora['strength']}")
-                pipe = unmerge_lora(pipe, lora["path"], lora["strength"])
+        
 
         if enable_sequential_cpu_offload:
             pipe.enable_sequential_cpu_offload()
@@ -471,8 +473,6 @@ class DownloadAndLoadCogVideoGGUFModel:
             transformer_config = json.load(f)
 
         sd = load_torch_file(gguf_path)
-        #for key, value in sd.items():
-        #    print(key, value.shape, value.dtype)
 
         from . import mz_gguf_loader
         import importlib
@@ -518,7 +518,6 @@ class DownloadAndLoadCogVideoGGUFModel:
                 transformer.to(offload_device)
             else:
                 transformer.to(device)
-
         
         
         if fp8_fastmode:
@@ -735,7 +734,7 @@ class CogVideoImageEncode:
             },
             "optional": {
                 "chunk_size": ("INT", {"default": 16, "min": 1}),
-                "enable_vae_slicing": ("BOOLEAN", {"default": True, "tooltip": "VAE will split the input tensor in slices to compute decoding in several steps. This is useful to save some memory and allow larger batch sizes."}),
+                "enable_tiling": ("BOOLEAN", {"default": False, "tooltip": "Enable tiling for the VAE to reduce memory usage"}),
                 "mask": ("MASK", ),
             },
         }
@@ -745,7 +744,7 @@ class CogVideoImageEncode:
     FUNCTION = "encode"
     CATEGORY = "CogVideoWrapper"
 
-    def encode(self, pipeline, image, chunk_size=8, enable_vae_slicing=True, mask=None):
+    def encode(self, pipeline, image, chunk_size=8, enable_tiling=False, mask=None):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         generator = torch.Generator(device=device).manual_seed(0)
@@ -753,14 +752,16 @@ class CogVideoImageEncode:
         B, H, W, C = image.shape
 
         vae = pipeline["pipe"].vae
+        vae.enable_slicing()
         
-        if enable_vae_slicing:
-            vae.enable_slicing()
-        else:
-            vae.disable_slicing()
+        if enable_tiling:
+            from .mz_enable_vae_encode_tiling import enable_vae_encode_tiling
+            enable_vae_encode_tiling(vae)
 
         if not pipeline["cpu_offloading"]:
             vae.to(device)
+
+        vae._clear_fake_context_parallel_cache()
         
         input_image = image.clone()
         if mask is not None:
@@ -1224,6 +1225,17 @@ class CogVideoXFunVid2VidSampler:
             #     pipeline = unmerge_lora(pipeline, _lora_path, _lora_weight)
         return (pipeline, {"samples": latents})
 
+def add_noise_to_reference_video(image, ratio=None):
+    if ratio is None:
+        sigma = torch.normal(mean=-3.0, std=0.5, size=(image.shape[0],)).to(image.device)
+        sigma = torch.exp(sigma).to(image.dtype)
+    else:
+        sigma = torch.ones((image.shape[0],)).to(image.device, image.dtype) * ratio
+    
+    image_noise = torch.randn_like(image) * sigma[:, None, None, None, None]
+    image_noise = torch.where(image==-1, torch.zeros_like(image), image_noise)
+    image = image + image_noise
+    return image
 
 class CogVideoControlImageEncode:
     @classmethod
@@ -1233,15 +1245,16 @@ class CogVideoControlImageEncode:
             "control_video": ("IMAGE", ),
             "base_resolution": ("INT", {"min": 256, "max": 1280, "step": 64, "default": 512, "tooltip": "Base resolution, closest training data bucket resolution is chosen based on the selection."}),
             "enable_tiling": ("BOOLEAN", {"default": False, "tooltip": "Enable tiling for the VAE to reduce memory usage"}),
+            "noise_aug_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
             },
         }
 
-    RETURN_TYPES = ("COGCONTROL_LATENTS",)
-    RETURN_NAMES = ("control_latents",)
+    RETURN_TYPES = ("COGCONTROL_LATENTS", "INT", "INT",)
+    RETURN_NAMES = ("control_latents", "width", "height")
     FUNCTION = "encode"
     CATEGORY = "CogVideoWrapper"
 
-    def encode(self, pipeline, control_video, base_resolution, enable_tiling):
+    def encode(self, pipeline, control_video, base_resolution, enable_tiling, noise_aug_strength=0.0563):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
 
@@ -1275,6 +1288,8 @@ class CogVideoControlImageEncode:
         control_video = rearrange(control_video, "(b f) c h w -> b c f h w", f=video_length)
 
         masked_image = control_video.to(device=device, dtype=vae.dtype)
+        if noise_aug_strength > 0:
+            masked_image = add_noise_to_reference_video(masked_image, ratio=noise_aug_strength)
         bs = 1
         new_mask_pixel_values = []
         for i in range(0, masked_image.shape[0], bs):
@@ -1294,7 +1309,7 @@ class CogVideoControlImageEncode:
             "width" : width,
         }
         
-        return (control_latents, )
+        return (control_latents, width, height)
         
 class CogVideoXFunControlSampler:
     @classmethod
@@ -1332,7 +1347,10 @@ class CogVideoXFunControlSampler:
                 "control_end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "t_tile_length": ("INT", {"default": 48, "min": 2, "max": 128, "step": 1, "tooltip": "Length of temporal tiles for extending generations, only in effect with the tiled samplers"}),
                 "t_tile_overlap": ("INT", {"default": 8, "min": 2, "max": 128, "step": 1, "tooltip": "Overlap of temporal tiling"}),
-
+            },
+            "optional": {
+                "samples": ("LATENT", ),
+                "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
         }
     
@@ -1341,8 +1359,9 @@ class CogVideoXFunControlSampler:
     FUNCTION = "process"
     CATEGORY = "CogVideoWrapper"
 
-    def process(self, pipeline, positive, negative, control_latents, seed, steps, cfg, scheduler, 
-                control_video=None, control_strength=1.0, control_start_percent=0.0, control_end_percent=1.0, t_tile_length=16, t_tile_overlap=8):
+    def process(self, pipeline, positive, negative, seed, steps, cfg, scheduler, control_latents, 
+                control_strength=1.0, control_start_percent=0.0, control_end_percent=1.0, t_tile_length=16, t_tile_overlap=8, 
+                samples=None, denoise_strength=1.0):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         pipe = pipeline["pipe"]
@@ -1390,7 +1409,9 @@ class CogVideoXFunControlSampler:
                 control_end_percent=control_end_percent,
                 t_tile_length=t_tile_length,
                 t_tile_overlap=t_tile_overlap,
-                scheduler_name=scheduler
+                scheduler_name=scheduler,
+                latents=samples["samples"] if samples is not None else None,
+                denoise_strength=denoise_strength,
             )
 
         return (pipeline, {"samples": latents})
