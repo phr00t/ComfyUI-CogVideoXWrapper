@@ -23,14 +23,16 @@ scheduler_mapping = {
     "Euler A": EulerAncestralDiscreteScheduler,
     "PNDM": PNDMScheduler,
     "DDIM": DDIMScheduler,
-    "DDIM_tiled": CogVideoXDDIMScheduler,
     "CogVideoXDDIM": CogVideoXDDIMScheduler,
     "CogVideoXDPMScheduler": CogVideoXDPMScheduler,
     "SASolverScheduler": SASolverScheduler,
     "UniPCMultistepScheduler": UniPCMultistepScheduler,
     "HeunDiscreteScheduler": HeunDiscreteScheduler,
-    "DEISMultistepScheduler": DEISMultistepScheduler
+    "DEISMultistepScheduler": DEISMultistepScheduler,
+    "LCMScheduler": LCMScheduler
 }
+available_schedulers = list(scheduler_mapping.keys())
+
 
 from diffusers.models import AutoencoderKLCogVideoX, CogVideoXTransformer3DModel
 from .pipeline_cogvideox import CogVideoXPipeline
@@ -43,7 +45,7 @@ from .cogvideox_fun.autoencoder_magvit import AutoencoderKLCogVideoX as Autoenco
 from .cogvideox_fun.utils import get_image_to_video_latent, get_video_to_video_latent, ASPECT_RATIO_512, get_closest_ratio, to_pil
 from .cogvideox_fun.pipeline_cogvideox_inpaint import CogVideoX_Fun_Pipeline_Inpaint
 from .cogvideox_fun.pipeline_cogvideox_control import CogVideoX_Fun_Pipeline_Control
-from .cogvideox_fun.lora_utils import merge_lora, unmerge_lora
+from .cogvideox_fun.lora_utils import merge_lora, load_lora_into_transformer
 from PIL import Image
 import numpy as np
 import json
@@ -218,7 +220,8 @@ class CogVideoLoraSelect:
 
         cog_lora = {
             "path": folder_paths.get_full_path("cogvideox_loras", lora),
-            "strength": strength
+            "strength": strength,
+            "name": lora.split(".")[0],
         }
 
         return (cog_lora,)
@@ -330,12 +333,14 @@ class DownloadAndLoadCogVideoModel:
         transformer = transformer.to(dtype).to(offload_device)
 
         if lora is not None:
-            if lora['strength'] > 0:
-                logging.info(f"Merging LoRA weights from {lora['path']} with strength {lora['strength']}")
+            logging.info(f"Merging LoRA weights from {lora['path']} with strength {lora['strength']}")
+            if "fun" in model.lower():
                 transformer = merge_lora(transformer, lora["path"], lora["strength"])
             else:
-                logging.info(f"Removing LoRA weights from {lora['path']} with strength {lora['strength']}")
-                transformer = unmerge_lora(transformer, lora["path"], lora["strength"])
+                lora_sd = load_torch_file(lora["path"])
+                transformer = load_lora_into_transformer(state_dict=lora_sd, transformer=transformer, adapter_name=lora["name"])
+                #raise NotImplementedError("LoRA merging is currently only supported for Fun models")
+
 
         if block_edit is not None:
             transformer = remove_specific_blocks(transformer, block_edit)
@@ -369,9 +374,7 @@ class DownloadAndLoadCogVideoModel:
                 pipe = CogVideoX_Fun_Pipeline_Inpaint(vae, transformer, scheduler, pab_config=pab_config)
         else:
             vae = AutoencoderKLCogVideoX.from_pretrained(base_path, subfolder="vae").to(dtype).to(offload_device)
-            pipe = CogVideoXPipeline(vae, transformer, scheduler, pab_config=pab_config)
-
-        
+            pipe = CogVideoXPipeline(vae, transformer, scheduler, pab_config=pab_config)        
 
         if enable_sequential_cpu_offload:
             pipe.enable_sequential_cpu_offload()
@@ -823,14 +826,16 @@ class CogVideoSampler:
                 "steps": ("INT", {"default": 50, "min": 1}),
                 "cfg": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 30.0, "step": 0.01}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
-                "scheduler": (["DDIM", "DPM", "DDIM_tiled"], {"tooltip": "5B likes DPM, but it doesn't support temporal tiling"}),
-                "t_tile_length": ("INT", {"default": 16, "min": 2, "max": 128, "step": 1, "tooltip": "Length of temporal tiling, use same alue as num_frames to disable, disabled automatically for DPM"}),
-                "t_tile_overlap": ("INT", {"default": 8, "min": 2, "max": 128, "step": 1, "tooltip": "Overlap of temporal tiling"}),
+                "scheduler": (available_schedulers,
+                    {
+                        "default": 'CogVideoXDDIM'
+                    }),
             },
             "optional": {
                 "samples": ("LATENT", ),
                 "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "image_cond_latents": ("LATENT", ),
+                "context_options": ("COGCONTEXT", ),
             }
         }
 
@@ -839,17 +844,13 @@ class CogVideoSampler:
     FUNCTION = "process"
     CATEGORY = "CogVideoWrapper"
 
-    def process(self, pipeline, positive, negative, steps, cfg, seed, height, width, num_frames, scheduler, t_tile_length, t_tile_overlap, samples=None, 
-                denoise_strength=1.0, image_cond_latents=None):
+    def process(self, pipeline, positive, negative, steps, cfg, seed, height, width, num_frames, scheduler, samples=None, 
+                denoise_strength=1.0, image_cond_latents=None, context_options=None):
         mm.soft_empty_cache()
 
         base_path = pipeline["base_path"]
 
         assert "fun" not in base_path.lower(), "'Fun' models not supported in 'CogVideoSampler', use the 'CogVideoXFunSampler'"
-        assert t_tile_length > t_tile_overlap, "t_tile_length must be greater than t_tile_overlap"
-        assert t_tile_length <= num_frames, "t_tile_length must be equal or less than num_frames"
-        t_tile_length = t_tile_length // 4
-        t_tile_overlap = t_tile_overlap // 4
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -859,12 +860,20 @@ class CogVideoSampler:
         
         if not pipeline["cpu_offloading"]:
             pipe.transformer.to(device)
-        generator = torch.Generator(device=device).manual_seed(seed)
+        generator = torch.Generator(device=torch.device("cpu")).manual_seed(seed)
 
-        if scheduler == "DDIM" or scheduler == "DDIM_tiled":
-            pipe.scheduler = CogVideoXDDIMScheduler.from_config(scheduler_config)
-        elif scheduler == "DPM":
-            pipe.scheduler = CogVideoXDPMScheduler.from_config(scheduler_config)
+        if scheduler in scheduler_mapping:
+            noise_scheduler = scheduler_mapping[scheduler].from_config(scheduler_config)
+            pipe.scheduler = noise_scheduler
+        else:
+            raise ValueError(f"Unknown scheduler: {scheduler}")
+        
+        if context_options is not None:
+            context_frames = context_options["context_frames"] // 4
+            context_stride = context_options["context_stride"] // 4
+            context_overlap = context_options["context_overlap"] // 4
+        else:
+            context_frames, context_stride, context_overlap = None, None, None
 
         if negative.shape[1] < positive.shape[1]:
             target_length = positive.shape[1]
@@ -879,8 +888,6 @@ class CogVideoSampler:
                 height = height,
                 width = width,
                 num_frames = num_frames,
-                t_tile_length = t_tile_length,
-                t_tile_overlap = t_tile_overlap,
                 guidance_scale=cfg,
                 latents=samples["samples"] if samples is not None else None,
                 image_cond_latents=image_cond_latents["samples"] if image_cond_latents is not None else None,
@@ -889,7 +896,12 @@ class CogVideoSampler:
                 negative_prompt_embeds=negative.to(dtype).to(device),
                 generator=generator,
                 device=device,
-                scheduler_name=scheduler
+                scheduler_name=scheduler,
+                context_schedule=context_options["context_schedule"] if context_options is not None else None,
+                context_frames=context_frames,
+                context_stride= context_stride,
+                context_overlap= context_overlap,
+                freenoise=context_options["freenoise"] if context_options is not None else None
             )
         if not pipeline["cpu_offloading"]:
             pipe.transformer.to(offload_device)
@@ -964,7 +976,7 @@ class CogVideoXFunSampler:
                 "pipeline": ("COGVIDEOPIPE",),
                 "positive": ("CONDITIONING", ),
                 "negative": ("CONDITIONING", ),
-                "video_length": ("INT", {"default": 49, "min": 5, "max": 49, "step": 4}),
+                "video_length": ("INT", {"default": 49, "min": 5, "max": 2048, "step": 4}),
                 "width": ("INT", {"default": 720, "min": 256, "max": 1024, "step": 4}),
                 "height": ("INT", {"default": 480, "min": 256, "max": 1024, "step": 4}),
                 "seed": ("INT", {"default": 43, "min": 0, "max": 0xffffffffffffffff}),
@@ -998,6 +1010,7 @@ class CogVideoXFunSampler:
                 "end_img": ("IMAGE",),
                 "opt_empty_latent": ("LATENT",),
                 "noise_aug_strength": ("FLOAT", {"default": 0.0563, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "context_options": ("COGCONTEXT", ),
             },
         }
     
@@ -1007,7 +1020,7 @@ class CogVideoXFunSampler:
     CATEGORY = "CogVideoWrapper"
 
     def process(self, pipeline,  positive, negative, video_length, width, height, seed, steps, cfg, scheduler, 
-                start_img=None, end_img=None, opt_empty_latent=None, noise_aug_strength=0.0563):
+                start_img=None, end_img=None, opt_empty_latent=None, noise_aug_strength=0.0563, context_options=None):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         pipe = pipeline["pipe"]
@@ -1031,6 +1044,9 @@ class CogVideoXFunSampler:
             original_height = opt_empty_latent["samples"][0].shape[-2] * 8
         
         # Load Sampler
+        if context_options is not None and context_options["context_schedule"] == "temporal_tiling":
+            logging.info("Temporal tiling enabled, changing scheduler to DDIM_tiled")
+            scheduler="DDIM_tiled"
         scheduler_config = pipeline["scheduler_config"]
         if scheduler == "DPM++":
             noise_scheduler = DPMSolverMultistepScheduler.from_config(scheduler_config)
@@ -1066,7 +1082,15 @@ class CogVideoXFunSampler:
 
         #if not pipeline["cpu_offloading"]:
         #    pipe.transformer.to(device)
-        generator= torch.Generator(device=device).manual_seed(seed)
+
+        if context_options is not None:
+            context_frames = context_options["context_frames"] // 4
+            context_stride = context_options["context_stride"] // 4
+            context_overlap = context_options["context_overlap"] // 4
+        else:
+            context_frames, context_stride, context_overlap = None, None, None
+
+        generator= torch.Generator(device="cpu").manual_seed(seed)
 
         autocastcondition = not pipeline["onediff"]
         autocast_context = torch.autocast(mm.get_autocast_device(device)) if autocastcondition else nullcontext()
@@ -1088,6 +1112,11 @@ class CogVideoXFunSampler:
                 mask_video   = input_video_mask,
                 comfyui_progressbar = True,
                 noise_aug_strength = noise_aug_strength,
+                context_schedule=context_options["context_schedule"] if context_options is not None else None,
+                context_frames=context_frames,
+                context_stride= context_stride,
+                context_overlap= context_overlap,
+                freenoise=context_options["freenoise"] if context_options is not None else None
             )
         #if not pipeline["cpu_offloading"]:
         #     pipe.transformer.to(offload_device)
@@ -1310,7 +1339,36 @@ class CogVideoControlImageEncode:
         }
         
         return (control_latents, width, height)
-        
+
+    
+class CogVideoContextOptions:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "context_schedule": (["uniform_standard", "uniform_looped", "static_standard", "temporal_tiling"],),
+            "context_frames": ("INT", {"default": 48, "min": 2, "max": 100, "step": 1, "tooltip": "Number of pixel frames in the context, NOTE: the latent space has 4 frames in 1"} ),
+            "context_stride": ("INT", {"default": 4, "min": 4, "max": 100, "step": 1, "tooltip": "Context stride as pixel frames, NOTE: the latent space has 4 frames in 1"} ),
+            "context_overlap": ("INT", {"default": 4, "min": 4, "max": 100, "step": 1, "tooltip": "Context overlap as pixel frames, NOTE: the latent space has 4 frames in 1"} ),
+            "freenoise": ("BOOLEAN", {"default": True, "tooltip": "Shuffle the noise"}),
+            }
+        }
+
+    RETURN_TYPES = ("COGCONTEXT", )
+    RETURN_NAMES = ("context_options",)
+    FUNCTION = "process"
+    CATEGORY = "CogVideoWrapper"
+
+    def process(self, context_schedule, context_frames, context_stride, context_overlap, freenoise):
+        context_options = {
+            "context_schedule":context_schedule,
+            "context_frames":context_frames,
+            "context_stride":context_stride,
+            "context_overlap":context_overlap,
+            "freenoise":freenoise
+        }
+
+        return (context_options,)
+            
 class CogVideoXFunControlSampler:
     @classmethod
     def INPUT_TYPES(s):
@@ -1323,34 +1381,15 @@ class CogVideoXFunControlSampler:
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
                 "steps": ("INT", {"default": 25, "min": 1, "max": 200, "step": 1}),
                 "cfg": ("FLOAT", {"default": 6.0, "min": 1.0, "max": 20.0, "step": 0.01}),
-                "scheduler": (
-                    [ 
-                        "Euler",
-                        "Euler A",
-                        "DPM++",
-                        "PNDM",
-                        "DDIM",
-                        "SASolverScheduler",
-                        "UniPCMultistepScheduler",
-                        "HeunDiscreteScheduler",
-                        "DEISMultistepScheduler",
-                        "CogVideoXDDIM",
-                        "CogVideoXDPMScheduler",
-                        "DDIM_tiled",
-                    ],
-                    {
-                        "default": 'DDIM'
-                    }
-                ),
+                "scheduler": (available_schedulers, {"default": 'DDIM'}),
                 "control_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
                 "control_start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "control_end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "t_tile_length": ("INT", {"default": 48, "min": 2, "max": 128, "step": 1, "tooltip": "Length of temporal tiles for extending generations, only in effect with the tiled samplers"}),
-                "t_tile_overlap": ("INT", {"default": 8, "min": 2, "max": 128, "step": 1, "tooltip": "Overlap of temporal tiling"}),
             },
             "optional": {
                 "samples": ("LATENT", ),
                 "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "context_options": ("COGCONTEXT", ),
             },
         }
     
@@ -1361,7 +1400,7 @@ class CogVideoXFunControlSampler:
 
     def process(self, pipeline, positive, negative, seed, steps, cfg, scheduler, control_latents, 
                 control_strength=1.0, control_start_percent=0.0, control_end_percent=1.0, t_tile_length=16, t_tile_overlap=8, 
-                samples=None, denoise_strength=1.0):
+                samples=None, denoise_strength=1.0, context_options=None):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         pipe = pipeline["pipe"]
@@ -1375,15 +1414,25 @@ class CogVideoXFunControlSampler:
 
         mm.soft_empty_cache()
 
+        if context_options is not None:
+            context_frames = context_options["context_frames"] // 4
+            context_stride = context_options["context_stride"] // 4
+            context_overlap = context_options["context_overlap"] // 4
+        else:
+            context_frames, context_stride, context_overlap = None, None, None
+
         # Load Sampler
         scheduler_config = pipeline["scheduler_config"]
+        if context_options is not None and context_options["context_schedule"] == "temporal_tiling":
+            logging.info("Temporal tiling enabled, changing scheduler to DDIM_tiled")
+            scheduler="DDIM_tiled"
         if scheduler in scheduler_mapping:
             noise_scheduler = scheduler_mapping[scheduler].from_config(scheduler_config)
             pipe.scheduler = noise_scheduler
         else:
             raise ValueError(f"Unknown scheduler: {scheduler}")
 
-        generator= torch.Generator(device).manual_seed(seed)
+        generator=torch.Generator(torch.device("cpu")).manual_seed(seed)
 
         autocastcondition = not pipeline["onediff"]
         autocast_context = torch.autocast(mm.get_autocast_device(device)) if autocastcondition else nullcontext()
@@ -1407,11 +1456,15 @@ class CogVideoXFunControlSampler:
                 control_strength=control_strength,
                 control_start_percent=control_start_percent,
                 control_end_percent=control_end_percent,
-                t_tile_length=t_tile_length,
-                t_tile_overlap=t_tile_overlap,
                 scheduler_name=scheduler,
                 latents=samples["samples"] if samples is not None else None,
                 denoise_strength=denoise_strength,
+                context_schedule=context_options["context_schedule"] if context_options is not None else None,
+                context_frames=context_frames,
+                context_stride= context_stride,
+                context_overlap= context_overlap,
+                freenoise=context_options["freenoise"] if context_options is not None else None
+                
             )
 
         return (pipeline, {"samples": latents})
@@ -1431,7 +1484,8 @@ NODE_CLASS_MAPPINGS = {
     "CogVideoPABConfig": CogVideoPABConfig,
     "CogVideoTransformerEdit": CogVideoTransformerEdit,
     "CogVideoControlImageEncode": CogVideoControlImageEncode,
-    "CogVideoLoraSelect": CogVideoLoraSelect
+    "CogVideoLoraSelect": CogVideoLoraSelect,
+    "CogVideoContextOptions": CogVideoContextOptions
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadCogVideoModel": "(Down)load CogVideo Model",
@@ -1448,5 +1502,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CogVideoPABConfig": "CogVideo PABConfig",
     "CogVideoTransformerEdit": "CogVideo TransformerEdit",
     "CogVideoControlImageEncode": "CogVideo Control ImageEncode",
-    "CogVideoLoraSelect": "CogVideo LoraSelect"
+    "CogVideoLoraSelect": "CogVideo LoraSelect",
+    "CogVideoContextOptions": "CogVideo Context Options"
     }

@@ -214,7 +214,8 @@ class CogVideoX_Fun_Pipeline_Control(VideoSysPipeline):
             set_pab_manager(pab_config)
 
     def prepare_latents(
-        self, batch_size, num_channels_latents, num_frames, height, width, dtype, device, generator, timesteps, denoise_strength, num_inference_steps, latents=None, 
+        self, batch_size, num_channels_latents, num_frames, height, width, dtype, device, generator, timesteps, denoise_strength, num_inference_steps,
+         latents=None, freenoise=True, context_size=None, context_overlap=None
     ):
         shape = (
             batch_size,
@@ -228,9 +229,43 @@ class CogVideoX_Fun_Pipeline_Control(VideoSysPipeline):
                 f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
-        noise = randn_tensor(shape, generator=generator, device=device, dtype=self.vae.dtype)
+        noise = randn_tensor(shape, generator=generator, device=torch.device("cpu"), dtype=self.vae.dtype)
+        if freenoise:
+            print("Applying FreeNoise")
+            # code and comments from AnimateDiff-Evolved by Kosinkadink (https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved)
+            video_length = num_frames // 4
+            delta = context_size - context_overlap
+            for start_idx in range(0, video_length-context_size, delta):
+                # start_idx corresponds to the beginning of a context window
+                # goal: place shuffled in the delta region right after the end of the context window
+                #       if space after context window is not enough to place the noise, adjust and finish
+                place_idx = start_idx + context_size
+                # if place_idx is outside the valid indexes, we are already finished
+                if place_idx >= video_length:
+                    break
+                end_idx = place_idx - 1
+                #print("video_length:", video_length, "start_idx:", start_idx, "end_idx:", end_idx, "place_idx:", place_idx, "delta:", delta)
+
+                # if there is not enough room to copy delta amount of indexes, copy limited amount and finish
+                if end_idx + delta >= video_length:
+                    final_delta = video_length - place_idx
+                    # generate list of indexes in final delta region
+                    list_idx = torch.tensor(list(range(start_idx,start_idx+final_delta)), device=torch.device("cpu"), dtype=torch.long)
+                    # shuffle list
+                    list_idx = list_idx[torch.randperm(final_delta, generator=generator)]
+                    # apply shuffled indexes
+                    noise[:, place_idx:place_idx + final_delta, :, :, :] = noise[:, list_idx, :, :, :]
+                    break
+                # otherwise, do normal behavior
+                # generate list of indexes in delta region
+                list_idx = torch.tensor(list(range(start_idx,start_idx+delta)), device=torch.device("cpu"), dtype=torch.long)
+                # shuffle list
+                list_idx = list_idx[torch.randperm(delta, generator=generator)]
+                # apply shuffled indexes
+                #print("place_idx:", place_idx, "delta:", delta, "list_idx:", list_idx)
+                noise[:, place_idx:place_idx + delta, :, :, :] = noise[:, list_idx, :, :, :]
         if latents is None:
-            latents = noise
+            latents = noise.to(device)
         else:
             latents = latents.to(device)
             timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, denoise_strength, device)
@@ -395,8 +430,9 @@ class CogVideoX_Fun_Pipeline_Control(VideoSysPipeline):
         width: int,
         num_frames: int,
         device: torch.device,
-        start_frame: int = None,
-        end_frame: int = None,
+        start_frame: Optional[int] = None,
+        end_frame: Optional[int] = None,
+        context_frames: Optional[int] = None,
         ) -> Tuple[torch.Tensor, torch.Tensor]:
         grid_height = height // (self.vae_scale_factor_spatial * self.transformer.config.patch_size)
         grid_width = width // (self.vae_scale_factor_spatial * self.transformer.config.patch_size)
@@ -414,12 +450,15 @@ class CogVideoX_Fun_Pipeline_Control(VideoSysPipeline):
             use_real=True,
         )
         
-        if start_frame is not None:
+        if start_frame is not None or context_frames is not None:
             freqs_cos = freqs_cos.view(num_frames, grid_height * grid_width, -1)
             freqs_sin = freqs_sin.view(num_frames, grid_height * grid_width, -1)
-
-            freqs_cos = freqs_cos[start_frame:end_frame]
-            freqs_sin = freqs_sin[start_frame:end_frame]
+            if context_frames is not None:
+                freqs_cos = freqs_cos[context_frames]
+                freqs_sin = freqs_sin[context_frames]
+            else:
+                freqs_cos = freqs_cos[start_frame:end_frame]
+                freqs_sin = freqs_sin[start_frame:end_frame]
 
             freqs_cos = freqs_cos.view(-1, freqs_cos.shape[-1])
             freqs_sin = freqs_sin.view(-1, freqs_sin.shape[-1])
@@ -483,9 +522,12 @@ class CogVideoX_Fun_Pipeline_Control(VideoSysPipeline):
         control_strength: float = 1.0,
         control_start_percent: float = 0.0,
         control_end_percent: float = 1.0,
-        t_tile_length: int = 12,
-        t_tile_overlap: int = 4,
         scheduler_name: str = "DPM",
+        context_schedule: Optional[str] = None,
+        context_frames: Optional[int] = None,
+        context_stride: Optional[int] = None,
+        context_overlap: Optional[int] = None,
+        freenoise: Optional[bool] = True,
     ) -> Union[CogVideoX_Fun_PipelineOutput, Tuple]:
         """
         Function invoked when calling the pipeline for generation.
@@ -628,6 +670,9 @@ class CogVideoX_Fun_Pipeline_Control(VideoSysPipeline):
             denoise_strength,
             num_inference_steps,
             latents,
+            context_size=context_frames,
+            context_overlap=context_overlap,
+            freenoise=freenoise,
         )
         if comfyui_progressbar:
             pbar.update(1)
@@ -652,23 +697,30 @@ class CogVideoX_Fun_Pipeline_Control(VideoSysPipeline):
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
 
         # 8.5. Temporal tiling prep
-        if "tiled" in scheduler_name:
-            t_tile_length = t_tile_length // 4
-            t_tile_overlap = t_tile_overlap // 4
+        if context_schedule is not None and context_schedule == "temporal_tiling":
+            t_tile_length = context_frames
+            t_tile_overlap = context_overlap
             t_tile_weights = self._gaussian_weights(t_tile_length=t_tile_length, t_batch_size=1).to(latents.device).to(self.vae.dtype)
-            temporal_tiling = True
-            
+            use_temporal_tiling = True
             print("Temporal tiling enabled")
+        elif context_schedule is not None:
+            print(f"Context schedule enabled: {context_frames} frames, {context_stride} stride, {context_overlap} overlap")
+            use_temporal_tiling = False
+            use_context_schedule = True
+            from .context import get_context_scheduler
+            context = get_context_scheduler(context_schedule)
+
         else:
-            temporal_tiling = False
-            print("Temporal tiling disabled")
+            use_temporal_tiling = False
+            use_context_schedule = False
+            print("Temporal tiling and context schedule disabled")
             # 7. Create rotary embeds if required
             image_rotary_emb = (
                 self._prepare_rotary_positional_embeddings(height, width, latents.size(1), device)
                 if self.transformer.config.use_rotary_positional_embeddings
                 else None
             )
-        #print("latents.shape", latents.shape)
+            
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             # for DPM-solver++
@@ -677,7 +729,7 @@ class CogVideoX_Fun_Pipeline_Control(VideoSysPipeline):
                 if self.interrupt:
                     continue
 
-                if temporal_tiling and isinstance(self.scheduler, CogVideoXDDIMScheduler):
+                if use_temporal_tiling and isinstance(self.scheduler, CogVideoXDDIMScheduler):
                     #temporal tiling code based on https://github.com/mayuelala/FollowYourEmoji/blob/main/models/video_pipeline.py
                     # =====================================================
                     grid_ts = 0
@@ -690,6 +742,12 @@ class CogVideoX_Fun_Pipeline_Control(VideoSysPipeline):
                     latents_all_list = []
                     # =====================================================
 
+                    image_rotary_emb = (
+                            self._prepare_rotary_positional_embeddings(height, width, context_frames, device)
+                            if self.transformer.config.use_rotary_positional_embeddings
+                            else None
+                        )
+
                     for t_i in range(grid_ts):
                         if t_i < grid_ts - 1:
                             ofs_t = max(t_i * t_tile_length - t_tile_overlap * t_i, 0)
@@ -698,12 +756,6 @@ class CogVideoX_Fun_Pipeline_Control(VideoSysPipeline):
 
                         input_start_t = ofs_t
                         input_end_t = ofs_t + t_tile_length
-
-                        image_rotary_emb = (
-                            self._prepare_rotary_positional_embeddings(height, width, latents.size(1), device, input_start_t, input_end_t)
-                            if self.transformer.config.use_rotary_positional_embeddings
-                            else None
-                        )
 
                         latents_tile = latents[:, input_start_t:input_end_t,:, :, :]
                         control_latents_tile = control_latents[:, input_start_t:input_end_t, :, :, :]
@@ -757,6 +809,98 @@ class CogVideoX_Fun_Pipeline_Control(VideoSysPipeline):
                         progress_bar.update()
                         pbar.update(1)
                     # ==========================================
+                elif use_context_schedule:
+                    
+                    latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                    # Calculate the current step percentage
+                    current_step_percentage = i / num_inference_steps
+
+                    # Determine if control_latents should be applied
+                    apply_control = control_start_percent <= current_step_percentage <= control_end_percent
+                    current_control_latents = control_latents if apply_control else torch.zeros_like(control_latents)
+
+                    # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                    timestep = t.expand(latent_model_input.shape[0])
+
+                    context_queue = list(context(
+                        i, num_inference_steps, latents.shape[1], context_frames, context_stride, context_overlap,
+                    ))
+                    counter = torch.zeros_like(latent_model_input)
+                    noise_pred = torch.zeros_like(latent_model_input)
+                    if do_classifier_free_guidance:
+                        noise_uncond = torch.zeros_like(latent_model_input)
+
+                    image_rotary_emb = (
+                            self._prepare_rotary_positional_embeddings(height, width, context_frames, device)
+                            if self.transformer.config.use_rotary_positional_embeddings
+                            else None
+                        )
+
+                    for c in context_queue:
+                        partial_latent_model_input = latent_model_input[:, c, :, :, :]
+                        partial_control_latents = current_control_latents[:, c, :, :, :]
+
+                        # predict noise model_output
+                        noise_pred[:, c, :, :, :] += self.transformer(
+                            hidden_states=partial_latent_model_input,
+                            encoder_hidden_states=prompt_embeds,
+                            timestep=timestep,
+                            image_rotary_emb=image_rotary_emb,
+                            return_dict=False,
+                            control_latents=partial_control_latents,
+                        )[0]
+                        
+                        # uncond
+                        if do_classifier_free_guidance:
+                            noise_uncond[:, c, :, :, :] += self.transformer(
+                                hidden_states=partial_latent_model_input,
+                                encoder_hidden_states=prompt_embeds,
+                                timestep=timestep,
+                                image_rotary_emb=image_rotary_emb,
+                                return_dict=False,
+                                control_latents=partial_control_latents,
+                            )[0]
+
+                        counter[:, c, :, :, :] += 1
+                        noise_pred = noise_pred.float()
+                        
+                    noise_pred /= counter
+                    if do_classifier_free_guidance:
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                       
+                    # compute the previous noisy sample x_t -> x_t-1
+                    if not isinstance(self.scheduler, CogVideoXDPMScheduler):
+                        latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                    else:
+                        latents, old_pred_original_sample = self.scheduler.step(
+                            noise_pred,
+                            old_pred_original_sample,
+                            t,
+                            timesteps[i - 1] if i > 0 else None,
+                            latents,
+                            **extra_step_kwargs,
+                            return_dict=False,
+                        )
+                    latents = latents.to(prompt_embeds.dtype)
+
+                    # call the callback, if provided
+                    if callback_on_step_end is not None:
+                        callback_kwargs = {}
+                        for k in callback_on_step_end_tensor_inputs:
+                            callback_kwargs[k] = locals()[k]
+                        callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                        latents = callback_outputs.pop("latents", latents)
+                        prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                        negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+
+                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                        progress_bar.update()
+                    if comfyui_progressbar:
+                        pbar.update(1)
                 else:
                     latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
