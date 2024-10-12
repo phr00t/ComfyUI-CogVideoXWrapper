@@ -343,7 +343,7 @@ class DownloadAndLoadCogVideoModel:
                 transformer = merge_lora(transformer, lora["path"], lora["strength"])
             else:
                 lora_sd = load_torch_file(lora["path"])
-                transformer = load_lora_into_transformer(state_dict=lora_sd, transformer=transformer, adapter_name=lora["name"])
+                transformer = load_lora_into_transformer(state_dict=lora_sd, transformer=transformer, adapter_name=lora["name"], strength=lora["strength"])
 
         if block_edit is not None:
             transformer = remove_specific_blocks(transformer, block_edit)
@@ -359,7 +359,10 @@ class DownloadAndLoadCogVideoModel:
                     if "patch_embed" not in name:
                         param.data = param.data.to(torch.float8_e4m3fn)
             else:
-                transformer.to(torch.float8_e4m3fn)
+                #transformer.to(torch.float8_e4m3fn)
+                for name, param in transformer.named_parameters():
+                    if "lora" not in name:
+                        param.data = param.data.to(torch.float8_e4m3fn)
         
             if fp8_transformer == "fastmode":
                 from .fp8_optimization import convert_fp8_linear
