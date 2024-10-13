@@ -350,19 +350,10 @@ class DownloadAndLoadCogVideoModel:
         
         #fp8
         if fp8_transformer == "enabled" or fp8_transformer == "fastmode":
-            if "2b" in model:
-                for name, param in transformer.named_parameters():
-                    if name != "pos_embedding":
-                        param.data = param.data.to(torch.float8_e4m3fn)
-            elif "I2V" in model:
-                for name, param in transformer.named_parameters():
-                    if "patch_embed" not in name:
-                        param.data = param.data.to(torch.float8_e4m3fn)
-            else:
-                #transformer.to(torch.float8_e4m3fn)
-                for name, param in transformer.named_parameters():
-                    if "lora" not in name:
-                        param.data = param.data.to(torch.float8_e4m3fn)
+            for name, param in transformer.named_parameters():
+                params_to_keep = {"patch_embed", "lora", "pos_embedding"}
+                if not any(keyword in name for keyword in params_to_keep):
+                    param.data = param.data.to(torch.float8_e4m3fn)
         
             if fp8_transformer == "fastmode":
                 from .fp8_optimization import convert_fp8_linear
@@ -738,14 +729,18 @@ class CogVideoTextEncode:
     CATEGORY = "CogVideoWrapper"
 
     def process(self, clip, prompt, strength=1.0, force_offload=True):
+        max_tokens = 226
         load_device = mm.text_encoder_device()
         offload_device = mm.text_encoder_offload_device()
         clip.tokenizer.t5xxl.pad_to_max_length = True
-        clip.tokenizer.t5xxl.max_length = 226
+        clip.tokenizer.t5xxl.max_length = max_tokens
         clip.cond_stage_model.to(load_device)
         tokens = clip.tokenize(prompt, return_word_ids=True)
-
+        
         embeds = clip.encode_from_tokens(tokens, return_pooled=False, return_dict=False)
+
+        if embeds.shape[1] > 226:
+            raise ValueError(f"Prompt is too long, max tokens supported is {max_tokens} or less, got {embeds.shape[1]}")
         embeds *= strength
         if force_offload:
             clip.cond_stage_model.to(offload_device)
@@ -819,6 +814,7 @@ class CogVideoImageEncode:
         if not pipeline["cpu_offloading"]:
             vae.to(device)
 
+        check_diffusers_version()
         vae._clear_fake_context_parallel_cache()
         
         input_image = image.clone()
