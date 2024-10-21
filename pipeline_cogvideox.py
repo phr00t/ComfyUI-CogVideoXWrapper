@@ -516,7 +516,7 @@ class CogVideoXPipeline(VideoSysPipeline):
                 latent_padding = torch.zeros(padding_shape, device=device, dtype=self.vae.dtype)
 
                 image_cond_latents = torch.cat([image_cond_latents[:, 0, :, :, :].unsqueeze(1), latent_padding, image_cond_latents[:, -1, :, :, :].unsqueeze(1)], dim=1)
-                logger.info("image cond latents shape: ",image_cond_latents.shape)
+                #logger.info("image cond latents shape: ",image_cond_latents.shape)
             else:
                 logger.info("Only one image conditioning frame received, img2vid")
                 padding_shape = (
