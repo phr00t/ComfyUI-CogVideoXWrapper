@@ -241,6 +241,7 @@ class DownloadAndLoadCogVideoModel:
                         "bertjiazheng/KoolCogVideoX-5b",
                         "kijai/CogVideoX-Fun-2b",
                         "kijai/CogVideoX-Fun-5b",
+                        "kijai/CogVideoX-5b-Tora",
                         "alibaba-pai/CogVideoX-Fun-V1.1-2b-InP",
                         "alibaba-pai/CogVideoX-Fun-V1.1-5b-InP",
                         "alibaba-pai/CogVideoX-Fun-V1.1-2b-Pose",
@@ -312,7 +313,7 @@ class DownloadAndLoadCogVideoModel:
         else:
             scheduler_path = os.path.join(script_directory, 'configs', 'scheduler_config_5b.json')
         
-        if not os.path.exists(base_path):
+        if not os.path.exists(base_path) or not os.path.exists(os.path.join(base_path, "transformer")):
             log.info(f"Downloading model to: {base_path}")
             from huggingface_hub import snapshot_download
 
@@ -396,6 +397,38 @@ class DownloadAndLoadCogVideoModel:
             fuse_qkv_projections=True if pab_config is None else False,
             )
 
+        if "Tora" in model:
+            import torch.nn as nn
+            from .tora.traj_module import MGF
+
+            hidden_size = 3072
+            num_layers = transformer.num_layers
+            pipe.transformer.fuser_list = nn.ModuleList([MGF(128, hidden_size) for _ in range(num_layers)])
+            fuser_sd = load_torch_file(os.path.join(base_path, "fuser", "fuser.safetensors"))
+            pipe.transformer.fuser_list.load_state_dict(fuser_sd)
+            for module in transformer.fuser_list:
+                for param in module.parameters():
+                    param.data = param.data.to(torch.float16)
+            del fuser_sd
+
+            from .tora.traj_module import TrajExtractor
+            traj_extractor = TrajExtractor(
+                vae_downsize=(4, 8, 8),
+                patch_size=2,
+                nums_rb=2,
+                cin=vae.config.latent_channels,
+                channels=[128] * transformer.num_layers,
+                sk=True,
+                use_conv=False,
+            )
+        
+            traj_sd = load_torch_file(os.path.join(base_path, "traj_extractor", "traj_extractor.safetensors"))
+            traj_extractor.load_state_dict(traj_sd)
+            traj_extractor.to(torch.float32).to(device)
+
+            pipe.traj_extractor = traj_extractor
+
+
         pipeline = {
             "pipe": pipe,
             "dtype": dtype,
@@ -420,6 +453,9 @@ class DownloadAndLoadCogVideoGGUFModel:
                         "CogVideoX_5b_fun_GGUF_Q4_0.safetensors",
                         "CogVideoX_5b_fun_1_1_GGUF_Q4_0.safetensors",
                         "CogVideoX_5b_fun_1_1_Pose_GGUF_Q4_0.safetensors",
+                        "CogVideoX_5b_Interpolation_GGUF_Q4_0.safetensors",
+                        "CogVideoX_5b_Tora_GGUF_Q4_0.safetensors",
+
                     ],
                 ),
             "vae_precision": (["fp16", "fp32", "bf16"], {"default": "bf16", "tooltip": "VAE dtype"}),
@@ -452,7 +488,7 @@ class DownloadAndLoadCogVideoGGUFModel:
         if not os.path.exists(gguf_path):
             gguf_path = os.path.join(download_path, model)
             if not os.path.exists(gguf_path):
-                if "I2V" in model or "1_1" in model:
+                if "I2V" in model or "1_1" in model or "Interpolation" in model or "Tora" in model:
                     repo_id = "Kijai/CogVideoX_GGUF"
                 else:
                     repo_id = "MinusZoneAI/ComfyUI-CogVideoX-MZ"
@@ -492,7 +528,7 @@ class DownloadAndLoadCogVideoGGUFModel:
                     transformer = CogVideoXTransformer3DModelFunPAB.from_config(transformer_config)
                 else:
                     transformer = CogVideoXTransformer3DModelFun.from_config(transformer_config)
-            elif "I2V" in model:
+            elif "I2V" in model or "Interpolation" in model:
                 transformer_config["in_channels"] = 32
                 if pab_config is not None:
                     transformer = CogVideoXTransformer3DModelPAB.from_config(transformer_config)
@@ -563,6 +599,63 @@ class DownloadAndLoadCogVideoGGUFModel:
             vae.load_state_dict(vae_sd)
             pipe = CogVideoXPipeline(vae, transformer, scheduler, pab_config=pab_config)
 
+        if "Tora" in model:
+            import torch.nn as nn
+            from .tora.traj_module import MGF
+
+            download_path = os.path.join(folder_paths.models_dir, 'CogVideo', "CogVideoX-5b-Tora")
+            fuser_path = os.path.join(download_path, "fuser", "fuser.safetensors")
+            if not os.path.exists(fuser_path):
+                log.info(f"Downloading Fuser model to: {fuser_path}")
+                from huggingface_hub import snapshot_download
+
+                snapshot_download(
+                    repo_id="kijai/CogVideoX-5b-Tora",
+                    allow_patterns=["*fuser.safetensors*"],
+                    local_dir=download_path,
+                    local_dir_use_symlinks=False,
+                )
+
+            hidden_size = 3072
+            num_layers = transformer.num_layers
+            pipe.transformer.fuser_list = nn.ModuleList([MGF(128, hidden_size) for _ in range(num_layers)])
+            
+            fuser_sd = load_torch_file(fuser_path)
+            pipe.transformer.fuser_list.load_state_dict(fuser_sd)
+            for module in transformer.fuser_list:
+                for param in module.parameters():
+                    param.data = param.data.to(torch.float16)
+            del fuser_sd
+
+            traj_extractor_path = os.path.join(download_path, "traj_extractor", "traj_extractor.safetensors")
+            if not os.path.exists(traj_extractor_path):
+                log.info(f"Downloading trajectory extractor model to: {traj_extractor_path}")
+                from huggingface_hub import snapshot_download
+
+                snapshot_download(
+                    repo_id="kijai/CogVideoX-5b-Tora",
+                    allow_patterns=["*traj_extractor.safetensors*"],
+                    local_dir=download_path,
+                    local_dir_use_symlinks=False,
+                )
+
+            from .tora.traj_module import TrajExtractor
+            traj_extractor = TrajExtractor(
+                vae_downsize=(4, 8, 8),
+                patch_size=2,
+                nums_rb=2,
+                cin=vae.config.latent_channels,
+                channels=[128] * transformer.num_layers,
+                sk=True,
+                use_conv=False,
+            )
+        
+            traj_sd = load_torch_file(traj_extractor_path)
+            traj_extractor.load_state_dict(traj_sd)
+            traj_extractor.to(torch.float32).to(device)
+
+            pipe.traj_extractor = traj_extractor
+
         if enable_sequential_cpu_offload:
             pipe.enable_sequential_cpu_offload()
 
@@ -570,7 +663,7 @@ class DownloadAndLoadCogVideoGGUFModel:
             "pipe": pipe,
             "dtype": vae_dtype,
             "base_path": model,
-            "onediff": True if compile == "onediff" else False,
+            "onediff": False,
             "cpu_offloading": enable_sequential_cpu_offload,
             "scheduler_config": scheduler_config,
             "model_name": model
@@ -935,6 +1028,67 @@ class CogVideoImageInterpolationEncode:
             vae.to(offload_device)
         
         return ({"samples": final_latents}, )
+    
+from .tora.traj_utils import process_traj, scale_traj_list_to_256
+from torchvision.utils import flow_to_image
+
+class ToraEncodeTrajectory:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "pipeline": ("COGVIDEOPIPE",),
+            "coordinates": ("STRING", {"forceInput": True}),
+            "width": ("INT", {"default": 720, "min": 128, "max": 2048, "step": 8}),
+            "height": ("INT", {"default": 480, "min": 128, "max": 2048, "step": 8}),
+            "num_frames": ("INT", {"default": 49, "min": 16, "max": 1024, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("TORAFEATURES", )
+    RETURN_NAMES = ("tora_trajectory", )
+    FUNCTION = "encode"
+    CATEGORY = "CogVideoWrapper"
+
+    def encode(self, pipeline, width, height, num_frames, coordinates):
+        check_diffusers_version()
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+        generator = torch.Generator(device=device).manual_seed(0)
+
+        traj_extractor = pipeline["pipe"].traj_extractor
+        vae = pipeline["pipe"].vae
+        vae.enable_slicing()
+        vae._clear_fake_context_parallel_cache()
+
+        #get coordinates from string and convert to compatible range/format (has to be 256x256 for the model)
+        coordinates = json.loads(coordinates.replace("'", '"'))
+        coordinates = [(coord['x'], coord['y']) for coord in coordinates]
+        traj_list_range_256 = scale_traj_list_to_256(coordinates, width, height)
+
+        video_flow, points = process_traj(traj_list_range_256, num_frames, (height,width), device=device)
+        video_flow = rearrange(video_flow, "T H W C -> T C H W")
+        video_flow = flow_to_image(video_flow).unsqueeze_(0).to(device)  # [1 T C H W]
+
+        video_flow = (
+            rearrange(video_flow / 255.0 * 2 - 1, "B T C H W -> B C T H W").contiguous().to(vae.dtype)
+        )
+        mm.soft_empty_cache()
+
+        # VAE encode
+        if not pipeline["cpu_offloading"]:
+            vae.to(device)
+
+        video_flow = vae.encode(video_flow).latent_dist.sample(generator) * vae.config.scaling_factor
+        vae.to(offload_device)
+
+        video_flow_features = traj_extractor(video_flow.to(torch.float32))
+        video_flow_features = torch.stack(video_flow_features)
+
+        logging.info(f"video_flow shape: {video_flow.shape}")
+
+        return (video_flow_features,)   
+        
+
 
 class CogVideoSampler:
     @classmethod
@@ -961,6 +1115,7 @@ class CogVideoSampler:
                 "image_cond_latents": ("LATENT", ),
                 "context_options": ("COGCONTEXT", ),
                 "controlnet": ("COGVIDECONTROLNET",),
+                "tora_trajectory": ("TORAFEATURES", ),
             }
         }
 
@@ -970,7 +1125,7 @@ class CogVideoSampler:
     CATEGORY = "CogVideoWrapper"
 
     def process(self, pipeline, positive, negative, steps, cfg, seed, height, width, num_frames, scheduler, samples=None, 
-                denoise_strength=1.0, image_cond_latents=None, context_options=None, controlnet=None):
+                denoise_strength=1.0, image_cond_latents=None, context_options=None, controlnet=None, tora_trajectory=None):
         mm.soft_empty_cache()
 
         base_path = pipeline["base_path"]
@@ -1028,7 +1183,8 @@ class CogVideoSampler:
                 context_stride= context_stride,
                 context_overlap= context_overlap,
                 freenoise=context_options["freenoise"] if context_options is not None else None,
-                controlnet=controlnet
+                controlnet=controlnet,
+                video_flow_features=tora_trajectory if tora_trajectory is not None else None,
             )
         if not pipeline["cpu_offloading"]:
             pipe.transformer.to(offload_device)
@@ -1217,7 +1373,7 @@ class CogVideoXFunSampler:
         else:
             context_frames, context_stride, context_overlap = None, None, None
 
-        generator= torch.Generator(device="cpu").manual_seed(seed)
+        generator = torch.Generator(device=torch.device("cpu")).manual_seed(seed)
 
         autocastcondition = not pipeline["onediff"]
         autocast_context = torch.autocast(mm.get_autocast_device(device)) if autocastcondition else nullcontext()
@@ -1347,7 +1503,7 @@ class CogVideoXFunVid2VidSampler:
             noise_scheduler = CogVideoXDPMScheduler.from_pretrained(base_path, subfolder= 'scheduler')
         pipe.scheduler = noise_scheduler
 
-        generator= torch.Generator(device).manual_seed(seed)
+        generator = torch.Generator(device=torch.device("cpu")).manual_seed(seed)
 
         autocastcondition = not pipeline["onediff"]
         autocast_context = torch.autocast(mm.get_autocast_device(device)) if autocastcondition else nullcontext()
@@ -1594,7 +1750,7 @@ class CogVideoXFunControlSampler:
         else:
             raise ValueError(f"Unknown scheduler: {scheduler}")
 
-        generator=torch.Generator(torch.device("cpu")).manual_seed(seed)
+        generator = torch.Generator(device=torch.device("cpu")).manual_seed(seed)
 
         autocastcondition = not pipeline["onediff"]
         autocast_context = torch.autocast(mm.get_autocast_device(device)) if autocastcondition else nullcontext()
@@ -1650,7 +1806,8 @@ NODE_CLASS_MAPPINGS = {
     "CogVideoLoraSelect": CogVideoLoraSelect,
     "CogVideoContextOptions": CogVideoContextOptions,
     "CogVideoControlNet": CogVideoControlNet,
-    "DownloadAndLoadCogVideoControlNet": DownloadAndLoadCogVideoControlNet
+    "DownloadAndLoadCogVideoControlNet": DownloadAndLoadCogVideoControlNet,
+    "ToraEncodeTrajectory": ToraEncodeTrajectory,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadCogVideoModel": "(Down)load CogVideo Model",
@@ -1670,5 +1827,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CogVideoControlImageEncode": "CogVideo Control ImageEncode",
     "CogVideoLoraSelect": "CogVideo LoraSelect",
     "CogVideoContextOptions": "CogVideo Context Options",
-    "DownloadAndLoadCogVideoControlNet": "(Down)load CogVideo ControlNet"
+    "DownloadAndLoadCogVideoControlNet": "(Down)load CogVideo ControlNet",
+    "ToraEncodeTrajectory": "Tora Encode Trajectory",
     }

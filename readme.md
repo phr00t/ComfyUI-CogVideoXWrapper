@@ -1,4 +1,19 @@
 # WORK IN PROGRESS
+## Update6
+
+Initial support for Tora (https://github.com/alibaba/Tora)
+
+Converted model (included in the autodownload node):
+
+https://huggingface.co/Kijai/CogVideoX-5b-Tora/tree/main
+
+
+https://github.com/user-attachments/assets/d5334237-03dc-48f5-8bec-3ae5998660c6
+
+
+
+
+
 ## Update5
 This week there's been some bigger updates that will most likely affect some old workflows, sampler node especially probably need to be refreshed (re-created) if it errors out!
 
@@ -76,3 +91,9 @@ https://github.com/user-attachments/assets/ecdac8b8-d434-48b6-abd6-90755b6b552d
 
 Original repo:
 https://github.com/THUDM/CogVideo
+
+CogVideoX-Fun:
+https://github.com/aigc-apps/CogVideoX-Fun
+
+Controlnet:
+https://github.com/TheDenk/cogvideox-controlnet
