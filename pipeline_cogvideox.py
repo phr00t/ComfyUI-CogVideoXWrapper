@@ -161,7 +161,6 @@ class CogVideoXPipeline(VideoSysPipeline):
         self.original_mask = original_mask
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
-        self.traj_extractor = None
 
         if pab_config is not None:
             set_pab_manager(pab_config)
@@ -383,14 +382,13 @@ class CogVideoXPipeline(VideoSysPipeline):
         prompt_embeds: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         device = torch.device("cuda"),
-        scheduler_name: str = "DPM",
         context_schedule: Optional[str] = None,
         context_frames: Optional[int] = None,
         context_stride: Optional[int] = None,
         context_overlap: Optional[int] = None,
         freenoise: Optional[bool] = True,
         controlnet: Optional[dict] = None,
-        video_flow_features: Optional[torch.Tensor] = None,
+        tora: Optional[dict] = None,
         
     ):
         """
@@ -582,8 +580,8 @@ class CogVideoXPipeline(VideoSysPipeline):
                 if self.transformer.config.use_rotary_positional_embeddings
                 else None
             )
-            if video_flow_features is not None and do_classifier_free_guidance:
-                video_flow_features = video_flow_features.repeat(1, 2, 1, 1, 1).contiguous()
+            if tora is not None and do_classifier_free_guidance:
+                video_flow_features = tora["video_flow_features"].repeat(1, 2, 1, 1, 1).contiguous()
 
         # 9. Controlnet
         if controlnet is not None:
@@ -610,6 +608,11 @@ class CogVideoXPipeline(VideoSysPipeline):
         else:
             controlnet_states = None
             control_weights= None
+
+        if tora is not None:
+            for module in self.transformer.fuser_list:
+                for param in module.parameters():
+                    param.data = param.data.to(device)
 
         # 10. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:    
@@ -784,11 +787,11 @@ class CogVideoXPipeline(VideoSysPipeline):
                     else:
                         for c in context_queue:
                             partial_latent_model_input = latent_model_input[:, c, :, :, :]
-                            if video_flow_features is not None:
+                            if (tora is not None and tora["start_percent"] <= current_step_percentage <= tora["end_percent"]):
                                 if do_classifier_free_guidance:
-                                    partial_video_flow_features = video_flow_features[:, c, :, :, :].repeat(1, 2, 1, 1, 1).contiguous()
+                                    partial_video_flow_features = tora["video_flow_features"][:, c, :, :, :].repeat(1, 2, 1, 1, 1).contiguous()
                                 else:
-                                    partial_video_flow_features = video_flow_features[:, c, :, :, :]
+                                    partial_video_flow_features = tora["video_flow_features"][:, c, :, :, :]
                             else:
                                 partial_video_flow_features = None
     
@@ -869,7 +872,8 @@ class CogVideoXPipeline(VideoSysPipeline):
                         return_dict=False,
                         controlnet_states=controlnet_states,
                         controlnet_weights=control_weights,
-                        video_flow_features=video_flow_features,
+                        video_flow_features=video_flow_features if (tora is not None and tora["start_percent"] <= current_step_percentage <= tora["end_percent"]) else None,
+
                     )[0]
                     noise_pred = noise_pred.float()
 
