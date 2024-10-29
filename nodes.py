@@ -256,6 +256,7 @@ class DownloadAndLoadCogVideoModel:
                         "alibaba-pai/CogVideoX-Fun-V1.1-2b-Pose",
                         "alibaba-pai/CogVideoX-Fun-V1.1-5b-Pose",
                         "feizhengcong/CogvideoX-Interpolation",
+                        "NimVideo/cogvideox-2b-img2vid"
                     ],
                 ),
 
@@ -309,9 +310,14 @@ class DownloadAndLoadCogVideoModel:
                 download_path = base_path
 
         elif "2b" in model:
-            base_path = os.path.join(download_path, "CogVideo2B")
-            download_path = base_path
-            repo_id = model
+            if 'img2vid' in model:
+                base_path = os.path.join(download_path, "cogvideox-2b-img2vid")
+                download_path = base_path
+                repo_id = model
+            else:
+                base_path = os.path.join(download_path, "CogVideo2B")
+                download_path = base_path
+                repo_id = model
         else:
             base_path = os.path.join(download_path, (model.split("/")[-1]))
             download_path = base_path
@@ -386,7 +392,9 @@ class DownloadAndLoadCogVideoModel:
                 pipe = CogVideoX_Fun_Pipeline_Inpaint(vae, transformer, scheduler, pab_config=pab_config)
         else:
             vae = AutoencoderKLCogVideoX.from_pretrained(base_path, subfolder="vae").to(dtype).to(offload_device)
-            pipe = CogVideoXPipeline(vae, transformer, scheduler, pab_config=pab_config)        
+            pipe = CogVideoXPipeline(vae, transformer, scheduler, pab_config=pab_config)
+            if "cogvideox-2b-img2vid" in model:
+                pipe.input_with_padding = False 
 
         if enable_sequential_cpu_offload:
             pipe.enable_sequential_cpu_offload()
@@ -1091,6 +1099,9 @@ class ToraEncodeTrajectory:
             "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
+            "optional": {
+                "enable_tiling": ("BOOL", {"default": False}),
+            }
         }
 
     RETURN_TYPES = ("TORAFEATURES", "IMAGE", )
@@ -1098,7 +1109,7 @@ class ToraEncodeTrajectory:
     FUNCTION = "encode"
     CATEGORY = "CogVideoWrapper"
 
-    def encode(self, pipeline, width, height, num_frames, coordinates, strength, start_percent, end_percent, tora_model):
+    def encode(self, pipeline, width, height, num_frames, coordinates, strength, start_percent, end_percent, tora_model, enable_tiling=False):
         check_diffusers_version()
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -1109,7 +1120,11 @@ class ToraEncodeTrajectory:
         try:
             vae._clear_fake_context_parallel_cache()
         except:
-            pass       
+            pass
+
+        if enable_tiling:
+            from .mz_enable_vae_encode_tiling import enable_vae_encode_tiling
+            enable_vae_encode_tiling(vae)
 
         if len(coordinates) < 10:
             coords_list = []
@@ -1225,7 +1240,34 @@ class ToraEncodeOpticalFlow:
         return (tora, )   
         
 
+class CogVideoXFasterCache:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "start_step": ("INT", {"default": 15, "min": 0, "max": 1024, "step": 1}),
+                "hf_step": ("INT", {"default": 30, "min": 0, "max": 1024, "step": 1}),
+                "lf_step": ("INT", {"default": 40, "min": 0, "max": 1024, "step": 1}),
+                "cache_device": (["main_device", "offload_device"], {"default": "main_device", "tooltip": "The device to use for the cache, main_device is on GPU and uses a lot of VRAM"}),
+            },
+        }
 
+    RETURN_TYPES = ("FASTERCACHEARGS",)
+    RETURN_NAMES = ("fastercache", )
+    FUNCTION = "args"
+    CATEGORY = "CogVideoWrapper"
+
+    def args(self, start_step, hf_step, lf_step, cache_device):
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+        fastercache = {
+            "start_step" : start_step,
+            "hf_step" : hf_step,
+            "lf_step" : lf_step,
+            "cache_device" : device if cache_device == "main_device" else offload_device
+        }
+        return (fastercache,)
+    
 class CogVideoSampler:
     @classmethod
     def INPUT_TYPES(s):
@@ -1252,6 +1294,7 @@ class CogVideoSampler:
                 "context_options": ("COGCONTEXT", ),
                 "controlnet": ("COGVIDECONTROLNET",),
                 "tora_trajectory": ("TORAFEATURES", ),
+                "fastercache": ("FASTERCACHEARGS", ),
             }
         }
 
@@ -1261,7 +1304,7 @@ class CogVideoSampler:
     CATEGORY = "CogVideoWrapper"
 
     def process(self, pipeline, positive, negative, steps, cfg, seed, height, width, num_frames, scheduler, samples=None, 
-                denoise_strength=1.0, image_cond_latents=None, context_options=None, controlnet=None, tora_trajectory=None):
+                denoise_strength=1.0, image_cond_latents=None, context_options=None, controlnet=None, tora_trajectory=None, fastercache=None):
         mm.soft_empty_cache()
 
         base_path = pipeline["base_path"]
@@ -1299,6 +1342,17 @@ class CogVideoSampler:
             target_length = positive.shape[1]
             padding = torch.zeros((negative.shape[0], target_length - negative.shape[1], negative.shape[2]), device=negative.device)
             negative = torch.cat((negative, padding), dim=1)
+
+        if fastercache is not None:
+            pipe.transformer.use_fastercache = True
+            pipe.transformer.fastercache_counter = 0
+            pipe.transformer.fastercache_start_step = fastercache["start_step"]
+            pipe.transformer.fastercache_lf_step = fastercache["lf_step"]
+            pipe.transformer.fastercache_hf_step = fastercache["hf_step"]
+            pipe.transformer.fastercache_device = fastercache["cache_device"]
+        else:
+            pipe.transformer.use_fastercache = False
+            pipe.transformer.fastercache_counter = 0
 
         autocastcondition = not pipeline["onediff"] or not dtype == torch.float32
         autocast_context = torch.autocast(mm.get_autocast_device(device)) if autocastcondition else nullcontext()
@@ -1951,6 +2005,7 @@ NODE_CLASS_MAPPINGS = {
     "ToraEncodeTrajectory": ToraEncodeTrajectory,
     "ToraEncodeOpticalFlow": ToraEncodeOpticalFlow,
     "DownloadAndLoadToraModel": DownloadAndLoadToraModel,
+    "CogVideoXFasterCache": CogVideoXFasterCache
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadCogVideoModel": "(Down)load CogVideo Model",
@@ -1974,4 +2029,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ToraEncodeTrajectory": "Tora Encode Trajectory",
     "ToraEncodeOpticalFlow": "Tora Encode OpticalFlow",
     "DownloadAndLoadToraModel": "(Down)load Tora Model",
+    "CogVideoXFasterCache": "CogVideoX FasterCache"
     }
